@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: client-notes-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "bash start.sh"
