@@ -125,3 +125,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+    from flask import Flask
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Бот работает!"  # Это для проверки Render
+
+if __name__ == '__main__':
+    # Запускаем Flask на порту 10000 (обязательно!)
+    import threading
+    threading.Thread(target=app.run, kwargs={'host':'0.0.0.0','port':10000}).start()
+    
+    # Запускаем бота
+    bot.polling(none_stop=True)
