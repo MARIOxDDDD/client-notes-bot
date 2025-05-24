@@ -1,169 +1,125 @@
-import telebot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
-from flask import Flask, request
-from waitress import serve
-import openpyxl
-from io import BytesIO
-import time
-from database import SessionLocal, Client
+from telebot import TeleBot, types
+import psycopg2
+import pandas as pd
+import os
+from datetime import datetime
 
 TOKEN = "8036531554:AAGyyLFsy8LyW--jPsdZuqnSl-3AfcAFWz0"
-WEBHOOK_HOST = "client-notes-bot.onrender.com"
-WEBHOOK_URL = f"https://{WEBHOOK_HOST}/{TOKEN}"
+bot = TeleBot(TOKEN)
 
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+# Подключение к PostgreSQL
+conn = psycopg2.connect("postgresql://client_notes_db_user:ujSU0BBRQ6swQwzRLwZ315LFWmYomGcn@dpg-d0p2rnuuk2gs7398b9s0-a/client_notes_db")
+cursor = conn.cursor()
 
-# Вебхук
-bot.remove_webhook()
-time.sleep(1)
-bot.set_webhook(url=WEBHOOK_URL)
+# Создание таблицы, если нет
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS clients (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        phone TEXT,
+        comment TEXT
+    )
+''')
+conn.commit()
 
-user_states = {}
-
+# Главное меню
 def main_menu():
-    markup = ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("➕ Добавить", "🔍 Найти", "📄 Список клиентов")
-    markup.row("✏️ Редактировать", "❌ Удалить", "📤 Экспорт")
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("➕ Добавить", "🔍 Найти")
+    markup.row("📋 Список клиентов", "✏️ Редактировать", "❌ Удалить")
+    markup.row("📤 Экспорт")
     return markup
-
-@app.route(f'/{TOKEN}', methods=['POST'])
-def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
-
-@app.route("/")
-def home():
-    return "Бот работает!"
 
 @bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=main_menu())
 
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить")
-def add_start(message):
-    user_states[message.chat.id] = {"state": "add_name"}
+# Состояния
+user_state = {}
+temp_data = {}
+
+@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
+def add_client(message):
+    user_state[message.chat.id] = "add_name"
     bot.send_message(message.chat.id, "Введите имя клиента:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "add_name")
-def add_phone(message):
-    user_states[message.chat.id]["name"] = message.text
-    user_states[message.chat.id]["state"] = "add_phone"
-    bot.send_message(message.chat.id, "Введите номер телефона (4 последние цифры):")
+@bot.message_handler(func=lambda message: user_state.get(message.chat.id) == "add_name")
+def add_name(message):
+    temp_data[message.chat.id] = {"name": message.text}
+    user_state[message.chat.id] = "add_phone"
+    bot.send_message(message.chat.id, "Введите номер телефона:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "add_phone")
-def add_description(message):
-    user_states[message.chat.id]["phone_last4"] = message.text
-    user_states[message.chat.id]["state"] = "add_description"
+@bot.message_handler(func=lambda message: user_state.get(message.chat.id) == "add_phone")
+def add_phone(message):
+    temp_data[message.chat.id]["phone"] = message.text
+    user_state[message.chat.id] = "add_comment"
     bot.send_message(message.chat.id, "Опишите стрижку или комментарии:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "add_description")
-def finish_add(message):
-    data = user_states.pop(message.chat.id, {})
-    db = SessionLocal()
-    client = Client(
-        name=data["name"],
-        phone_last4=data["phone_last4"],
-        description=message.text
-    )
-    db.add(client)
-    db.commit()
-    db.close()
+@bot.message_handler(func=lambda message: user_state.get(message.chat.id) == "add_comment")
+def add_comment(message):
+    data = temp_data.pop(message.chat.id)
+    data["comment"] = message.text
+    cursor.execute("INSERT INTO clients (name, phone, comment) VALUES (%s, %s, %s)",
+                   (data["name"], data["phone"], data["comment"]))
+    conn.commit()
+    user_state.pop(message.chat.id)
     bot.send_message(message.chat.id, "✅ Клиент добавлен!", reply_markup=main_menu())
 
-@bot.message_handler(func=lambda m: m.text == "🔍 Найти")
-def search_client_prompt(message):
-    user_states[message.chat.id] = {"state": "search"}
+@bot.message_handler(func=lambda msg: msg.text == "🔍 Найти")
+def find_client(message):
+    user_state[message.chat.id] = "find"
     bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "search")
-def search_client(message):
-    phone = message.text
-    db = SessionLocal()
-    client = db.query(Client).filter(Client.phone_last4 == phone).first()
-    db.close()
-    if client:
-        bot.send_message(message.chat.id, f"👤 Имя: {client.name}\n📞 Тел: ****{client.phone_last4}\n💈 Стрижка: {client.description}", reply_markup=main_menu())
-    else:
-        bot.send_message(message.chat.id, "❗ Клиент не найден", reply_markup=main_menu())
-    user_states.pop(message.chat.id, None)
+@bot.message_handler(func=lambda message: user_state.get(message.chat.id) == "find")
+def do_find(message):
+    digits = message.text[-4:]
+    cursor.execute("SELECT name, phone, comment FROM clients WHERE phone LIKE %s", ('%' + digits,))
+    results = cursor.fetchall()
+    user_state.pop(message.chat.id)
 
-@bot.message_handler(func=lambda m: m.text == "📄 Список клиентов")
+    if results:
+        for row in results:
+            bot.send_message(message.chat.id, f"👤 {row[0]}\n📞 {row[1]}\n💬 {row[2]}")
+    else:
+        bot.send_message(message.chat.id, "❌ Клиент не найден.")
+
+@bot.message_handler(func=lambda msg: msg.text == "📋 Список клиентов")
 def list_clients(message):
-    db = SessionLocal()
-    clients = db.query(Client).all()
-    db.close()
-    if clients:
-        text = "\n\n".join([f"👤 {c.name}, 📞 ****{c.phone_last4}, 💈 {c.description}" for c in clients])
-        bot.send_message(message.chat.id, text)
-    else:
+    cursor.execute("SELECT name, phone FROM clients")
+    rows = cursor.fetchall()
+    if not rows:
         bot.send_message(message.chat.id, "Список пуст.")
+    else:
+        reply = "\n\n".join([f"👤 {name} — 📞 {phone}" for name, phone in rows])
+        bot.send_message(message.chat.id, reply)
 
-@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
+@bot.message_handler(func=lambda msg: msg.text == "📤 Экспорт")
 def export_clients(message):
-    db = SessionLocal()
-    clients = db.query(Client).all()
-    db.close()
+    cursor.execute("SELECT name, phone, comment FROM clients")
+    rows = cursor.fetchall()
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.append(["Имя", "Телефон", "Описание"])
-    for c in clients:
-        ws.append([c.name, c.phone_last4, c.description])
+    if not rows:
+        bot.send_message(message.chat.id, "Нет данных для экспорта.")
+        return
 
-    output = BytesIO()
-    wb.save(output)
-    output.seek(0)
+    df = pd.DataFrame(rows, columns=["Имя", "Телефон", "Комментарий"])
+    filename = f"clients_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df.to_excel(filename, index=False)
 
-    bot.send_document(message.chat.id, output, visible_file_name="clients.xlsx")
+    with open(filename, "rb") as file:
+        bot.send_document(message.chat.id, file)
 
-@bot.message_handler(func=lambda m: m.text == "❌ Удалить")
-def delete_prompt(message):
-    user_states[message.chat.id] = {"state": "delete"}
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера для удаления:")
+    os.remove(filename)
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "delete")
-def delete_client(message):
-    db = SessionLocal()
-    client = db.query(Client).filter(Client.phone_last4 == message.text).first()
-    if client:
-        db.delete(client)
-        db.commit()
-        bot.send_message(message.chat.id, "🗑️ Клиент удалён", reply_markup=main_menu())
-    else:
-        bot.send_message(message.chat.id, "❗ Клиент не найден", reply_markup=main_menu())
-    db.close()
-    user_states.pop(message.chat.id, None)
+# Заглушки для будущих функций
+@bot.message_handler(func=lambda msg: msg.text == "✏️ Редактировать")
+def edit_placeholder(message):
+    bot.send_message(message.chat.id, "🔧 Функция редактирования пока в разработке.")
 
-@bot.message_handler(func=lambda m: m.text == "✏️ Редактировать")
-def edit_prompt(message):
-    user_states[message.chat.id] = {"state": "edit_search"}
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента:")
+@bot.message_handler(func=lambda msg: msg.text == "❌ Удалить")
+def delete_placeholder(message):
+    bot.send_message(message.chat.id, "🗑️ Функция удаления пока в разработке.")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "edit_search")
-def edit_description(message):
-    db = SessionLocal()
-    client = db.query(Client).filter(Client.phone_last4 == message.text).first()
-    if client:
-        user_states[message.chat.id] = {"state": "edit", "client_id": client.id}
-        bot.send_message(message.chat.id, "Введите новое описание:")
-    else:
-        bot.send_message(message.chat.id, "❗ Клиент не найден", reply_markup=main_menu())
-    db.close()
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("state") == "edit")
-def update_description(message):
-    db = SessionLocal()
-    client = db.query(Client).filter(Client.id == user_states[message.chat.id]["client_id"]).first()
-    if client:
-        client.description = message.text
-        db.commit()
-        bot.send_message(message.chat.id, "✏️ Описание обновлено!", reply_markup=main_menu())
-    else:
-        bot.send_message(message.chat.id, "Ошибка при обновлении.")
-    db.close()
-    user_states.pop(message.chat.id, None)
-
-if __name__ == "__main__":
-    serve(app, host="0.0.0.0", port=10000)
+# Запуск
+print("Бот запущен.")
+bot.polling(none_stop=True)
