@@ -1,190 +1,174 @@
-from flask import Flask, request
 import telebot
+from telebot import types
+from flask import Flask, request
+from waitress import serve
 import psycopg2
 import pandas as pd
-from telebot import types
-from datetime import datetime
-from waitress import serve
+import os
+from io import BytesIO
 
-# === КОНФИГ ===
+# === Конфигурация ===
 TOKEN = "8036531554:AAGyyLFsy8LyW--jPsdZuqnSl-3AfcAFWz0"
-DATABASE_URL = "postgresql://client_notes_db_user:ujSU0BBRQ6swQwzRLwZ315LFWmYomGcn@dpg-d0p2rnuuk2gs7398b9s0-a/client_notes_db"
-WEBHOOK_URL = f"https://client-notes-bot.onrender.com/{TOKEN}"
-
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+WEBHOOK_URL = f"https://client-notes-bot.onrender.com/{TOKEN}"
 
-# === БАЗА ДАННЫХ ===
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+# === Подключение к PostgreSQL ===
+DB_URL = "postgresql://client_notes_db_user:ujSU0BBRQ6swQwzRLwZ315LFWmYomGcn@dpg-d0p2rnuuk2gs7398b9s0-a/client_notes_db"
+conn = psycopg2.connect(DB_URL, sslmode='require')
 cur = conn.cursor()
 
+# === Создание таблицы, если не существует ===
 cur.execute("""
 CREATE TABLE IF NOT EXISTS clients (
     id SERIAL PRIMARY KEY,
     name TEXT,
     phone TEXT,
-    comment TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-)
+    notes TEXT
+);
 """)
 conn.commit()
 
-user_states = {}
-
-# === МЕНЮ ===
-def main_menu():
+# === Клавиатура ===
+def main_keyboard():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Добавить", "🔍 Найти")
-    markup.add("📋 Список клиентов", "📤 Экспорт")
-    markup.add("📝 Редактировать", "❌ Удалить")
+    markup.row("➕ Добавить", "🔍 Найти")
+    markup.row("📋 Список", "📃 Экспорт")
+    markup.row("✏️ Редактировать", "🗑️ Удалить")
     return markup
 
+# === Состояния ===
+user_state = {}
+
+# === Команды ===
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=main_keyboard())
 
-# === ДОБАВИТЬ КЛИЕНТА ===
+# === Добавление клиента ===
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить")
 def add_client(message):
+    user_state[message.chat.id] = {"action": "add"}
     bot.send_message(message.chat.id, "Введите имя клиента:")
-    user_states[message.chat.id] = {"step": "name"}
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "name")
-def step_name(message):
-    user_states[message.chat.id]["name"] = message.text
-    user_states[message.chat.id]["step"] = "phone"
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "add" and "name" not in user_state[m.chat.id])
+def get_name(message):
+    user_state[message.chat.id]["name"] = message.text
     bot.send_message(message.chat.id, "Введите номер телефона:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "phone")
-def step_phone(message):
-    user_states[message.chat.id]["phone"] = message.text
-    user_states[message.chat.id]["step"] = "comment"
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "add" and "phone" not in user_state[m.chat.id])
+def get_phone(message):
+    user_state[message.chat.id]["phone"] = message.text
     bot.send_message(message.chat.id, "Опишите стрижку или комментарии:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "comment")
-def step_comment(message):
-    state = user_states.pop(message.chat.id)
-    cur.execute("INSERT INTO clients (name, phone, comment) VALUES (%s, %s, %s)",
-                (state["name"], state["phone"], message.text))
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "add" and "notes" not in user_state[m.chat.id])
+def get_notes(message):
+    data = user_state[message.chat.id]
+    data["notes"] = message.text
+    cur.execute("INSERT INTO clients (name, phone, notes) VALUES (%s, %s, %s)", (data["name"], data["phone"], data["notes"]))
     conn.commit()
-    bot.send_message(message.chat.id, "✅ Клиент добавлен!", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "✅ Клиент сохранён!", reply_markup=main_keyboard())
+    user_state.pop(message.chat.id)
 
-# === ПОИСК ===
+# === Поиск клиента ===
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти")
-def find_client(message):
+def search_prompt(message):
+    user_state[message.chat.id] = {"action": "search"}
     bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
-    user_states[message.chat.id] = {"step": "find"}
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "find")
-def step_find(message):
-    query = f"%{message.text}"
-    cur.execute("SELECT name, phone, comment FROM clients WHERE phone LIKE %s", (query,))
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "search")
+def perform_search(message):
+    query = f"%{message.text[-4:]}%"
+    cur.execute("SELECT name, phone, notes FROM clients WHERE phone LIKE %s", (query,))
     results = cur.fetchall()
-    user_states.pop(message.chat.id, None)
-
     if results:
         for r in results:
-            bot.send_message(message.chat.id, f"👤 {r[0]}\n📞 {r[1]}\n💈 {r[2]}")
+            bot.send_message(message.chat.id, f"👤 {r[0]}\n📞 {r[1]}\n💬 {r[2]}")
     else:
-        bot.send_message(message.chat.id, "❌ Клиентов не найдено.")
+        bot.send_message(message.chat.id, "❌ Клиент не найден.")
+    user_state.pop(message.chat.id)
 
-# === СПИСОК КЛИЕНТОВ ===
-@bot.message_handler(func=lambda m: m.text == "📋 Список клиентов")
+# === Список клиентов ===
+@bot.message_handler(func=lambda m: m.text == "📋 Список")
 def list_clients(message):
-    cur.execute("SELECT name, phone, comment FROM clients ORDER BY created_at DESC LIMIT 10")
-    clients = cur.fetchall()
-    if clients:
-        for c in clients:
-            bot.send_message(message.chat.id, f"👤 {c[0]}\n📞 {c[1]}\n💈 {c[2]}")
+    cur.execute("SELECT name, phone FROM clients")
+    rows = cur.fetchall()
+    if rows:
+        text = "\n".join([f"{i+1}. {r[0]} ({r[1]})" for i, r in enumerate(rows)])
+        bot.send_message(message.chat.id, f"👥 Клиенты:\n{text}")
     else:
         bot.send_message(message.chat.id, "Список пуст.")
 
-# === ЭКСПОРТ ===
-@bot.message_handler(func=lambda m: m.text == "📤 Экспорт")
-def export_clients(message):
-    cur.execute("SELECT name, phone, comment, created_at FROM clients")
-    data = cur.fetchall()
-    df = pd.DataFrame(data, columns=["Имя", "Телефон", "Комментарий", "Дата"])
-    file_path = "clients_export.xlsx"
-    df.to_excel(file_path, index=False)
+# === Экспорт в Excel ===
+@bot.message_handler(func=lambda m: m.text == "📃 Экспорт")
+def export_excel(message):
+    cur.execute("SELECT name, phone, notes FROM clients")
+    rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=["Имя", "Телефон", "Комментарий"])
+    bio = BytesIO()
+    bio.name = "clients.xlsx"
+    df.to_excel(bio, index=False)
+    bio.seek(0)
+    bot.send_document(message.chat.id, bio)
 
-    with open(file_path, "rb") as file:
-        bot.send_document(message.chat.id, file)
+# === Удаление клиента ===
+@bot.message_handler(func=lambda m: m.text == "🗑️ Удалить")
+def delete_prompt(message):
+    user_state[message.chat.id] = {"action": "delete"}
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента для удаления:")
 
-# === РЕДАКТИРОВАНИЕ ===
-@bot.message_handler(func=lambda m: m.text == "📝 Редактировать")
-def start_edit(message):
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента:")
-    user_states[message.chat.id] = {"step": "edit_find"}
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "delete")
+def delete_client(message):
+    query = f"%{message.text[-4:]}%"
+    cur.execute("DELETE FROM clients WHERE phone LIKE %s", (query,))
+    deleted = cur.rowcount
+    conn.commit()
+    if deleted:
+        bot.send_message(message.chat.id, f"🗑️ Удалено {deleted} клиент(ов).")
+    else:
+        bot.send_message(message.chat.id, "❌ Ничего не найдено.")
+    user_state.pop(message.chat.id)
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "edit_find")
-def step_edit_find(message):
-    query = f"%{message.text}"
-    cur.execute("SELECT id, name, phone, comment FROM clients WHERE phone LIKE %s", (query,))
+# === Редактирование ===
+@bot.message_handler(func=lambda m: m.text == "✏️ Редактировать")
+def edit_prompt(message):
+    user_state[message.chat.id] = {"action": "edit"}
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента для редактирования:")
+
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "edit" and "target" not in user_state[m.chat.id])
+def edit_target(message):
+    query = f"%{message.text[-4:]}%"
+    cur.execute("SELECT id, name, phone, notes FROM clients WHERE phone LIKE %s", (query,))
     result = cur.fetchone()
     if result:
-        user_states[message.chat.id] = {
-            "step": "edit_name", "id": result[0]
-        }
-        bot.send_message(message.chat.id, f"Клиент найден:\n👤 {result[1]}\n📞 {result[2]}\n💈 {result[3]}\n\nВведите новое имя:")
+        user_state[message.chat.id]["target"] = result[0]
+        bot.send_message(message.chat.id, "Введите новое имя:")
     else:
         bot.send_message(message.chat.id, "❌ Клиент не найден.")
-        user_states.pop(message.chat.id, None)
+        user_state.pop(message.chat.id)
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "edit_name")
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "edit" and "new_name" not in user_state[m.chat.id])
 def edit_name(message):
-    user_states[message.chat.id]["name"] = message.text
-    user_states[message.chat.id]["step"] = "edit_phone"
+    user_state[message.chat.id]["new_name"] = message.text
     bot.send_message(message.chat.id, "Введите новый номер:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "edit_phone")
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "edit" and "new_phone" not in user_state[m.chat.id])
 def edit_phone(message):
-    user_states[message.chat.id]["phone"] = message.text
-    user_states[message.chat.id]["step"] = "edit_comment"
+    user_state[message.chat.id]["new_phone"] = message.text
     bot.send_message(message.chat.id, "Введите новый комментарий:")
 
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "edit_comment")
-def edit_comment(message):
-    state = user_states.pop(message.chat.id)
-    cur.execute("UPDATE clients SET name=%s, phone=%s, comment=%s WHERE id=%s",
-                (state["name"], state["phone"], message.text, state["id"]))
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id, {}).get("action") == "edit" and "new_notes" not in user_state[m.chat.id])
+def edit_notes(message):
+    state = user_state[message.chat.id]
+    cur.execute(
+        "UPDATE clients SET name = %s, phone = %s, notes = %s WHERE id = %s",
+        (state["new_name"], state["new_phone"], message.text, state["target"])
+    )
     conn.commit()
-    bot.send_message(message.chat.id, "✅ Клиент обновлён.", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "✏️ Данные обновлены.", reply_markup=main_keyboard())
+    user_state.pop(message.chat.id)
 
-# === УДАЛЕНИЕ ===
-@bot.message_handler(func=lambda m: m.text == "❌ Удалить")
-def delete_start(message):
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента:")
-    user_states[message.chat.id] = {"step": "delete_find"}
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "delete_find")
-def delete_find(message):
-    query = f"%{message.text}"
-    cur.execute("SELECT id, name FROM clients WHERE phone LIKE %s", (query,))
-    result = cur.fetchone()
-    if result:
-        user_states[message.chat.id] = {"step": "confirm_delete", "id": result[0]}
-        bot.send_message(message.chat.id, f"Удалить клиента {result[1]}? (да/нет)")
-    else:
-        bot.send_message(message.chat.id, "❌ Клиент не найден.")
-        user_states.pop(message.chat.id, None)
-
-@bot.message_handler(func=lambda m: user_states.get(m.chat.id, {}).get("step") == "confirm_delete")
-def confirm_delete(message):
-    if message.text.lower() == "да":
-        client_id = user_states[message.chat.id]["id"]
-        cur.execute("DELETE FROM clients WHERE id=%s", (client_id,))
-        conn.commit()
-        bot.send_message(message.chat.id, "✅ Клиент удалён.", reply_markup=main_menu())
-    else:
-        bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=main_menu())
-    user_states.pop(message.chat.id, None)
-
-# === ВЕБХУК ===
-bot.remove_webhook()
-import time; time.sleep(1)
-bot.set_webhook(url=WEBHOOK_URL)
-
+# === Вебхук для Render ===
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
@@ -192,8 +176,10 @@ def webhook():
     return "OK", 200
 
 @app.route("/")
-def home():
+def index():
     return "Бот работает!"
 
 if __name__ == "__main__":
-    serve(app, host="0.0.0.0", port=10000)
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
