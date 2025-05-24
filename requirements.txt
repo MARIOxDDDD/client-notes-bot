@@ -8,3 +8,4 @@ pytelegrambotapi
 Flask
 waitress
 tinydb
+openpyxl
