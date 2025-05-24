@@ -1,5 +1,6 @@
-flask
-telebot
-psycopg2-binary
-pandas
-waitress
+Flask==2.3.3
+telebot==0.0.5
+waitress==2.1.2
+SQLAlchemy==2.0.30
+openpyxl==3.1.2
+psycopg2-binary==2.9.9
