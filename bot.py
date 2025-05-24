@@ -1,123 +1,133 @@
-import telebot
-import json
 import os
+import telebot
 from telebot import types
 from flask import Flask, request
 from waitress import serve
+from tinydb import TinyDB, Query
+import time
+import openpyxl
+from telebot.types import InputFile
 
 TOKEN = "8036531554:AAGyyLFsy8LyW--jPsdZuqnSl-3AfcAFWz0"
+SERVICE_NAME = "client-notes-bot"
+WEBHOOK_URL = f"https://{SERVICE_NAME}.onrender.com/{TOKEN}"
+
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
-DATA_FILE = "clients.json"
 
-# Загрузка базы
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+db = TinyDB(os.path.join(BASE_DIR, 'clients.json'))
+User = Query()
 
-# Сохранение базы
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-clients = load_data()
+# Удалим вебхук и установим новый
+bot.remove_webhook()
+time.sleep(1)
+bot.set_webhook(url=WEBHOOK_URL)
 
 # Главное меню
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("➕ Добавить", "🔍 Найти")
-    markup.add("📋 Список клиентов", "✏️ Редактировать", "❌ Удалить клиента")
+    markup.add("📋 Список клиентов", "❌ Удалить")
+    markup.add("📤 Экспорт в Excel")
     return markup
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=["start"])
 def start(message):
     bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=main_menu())
 
-# ➕ Добавление клиента
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить")
+# Добавление клиента
+client_data = {}
+
+@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
 def add_client(message):
-    msg = bot.send_message(message.chat.id, "Введите имя клиента:")
-    bot.register_next_step_handler(msg, get_name)
+    bot.send_message(message.chat.id, "Введите имя клиента:")
+    bot.register_next_step_handler(message, get_name)
 
 def get_name(message):
-    name = message.text
-    msg = bot.send_message(message.chat.id, "Введите номер телефона:")
-    bot.register_next_step_handler(msg, get_phone, name)
+    client_data["name"] = message.text
+    bot.send_message(message.chat.id, "Введите номер телефона:")
+    bot.register_next_step_handler(message, get_phone)
 
-def get_phone(message, name):
-    phone = message.text
-    msg = bot.send_message(message.chat.id, "Опишите стрижку или комментарии:")
-    bot.register_next_step_handler(msg, save_client, name, phone)
+def get_phone(message):
+    client_data["phone"] = message.text
+    bot.send_message(message.chat.id, "Опишите стрижку или комментарии:")
+    bot.register_next_step_handler(message, get_comment)
 
-def save_client(message, name, phone):
-    info = message.text
-    clients[phone] = {"name": name, "info": info}
-    save_data(clients)
-    bot.send_message(message.chat.id, "✅ Клиент сохранён!", reply_markup=main_menu())
+def get_comment(message):
+    client_data["comment"] = message.text
+    db.insert(client_data.copy())
+    bot.send_message(message.chat.id, "✅ Клиент добавлен!", reply_markup=main_menu())
 
-# 🔍 Поиск по последним 4 цифрам
-@bot.message_handler(func=lambda m: m.text == "🔍 Найти")
+# Поиск клиента
+@bot.message_handler(func=lambda msg: msg.text == "🔍 Найти")
 def find_client(message):
-    msg = bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
-    bot.register_next_step_handler(msg, search_by_phone)
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
+    bot.register_next_step_handler(message, search_client)
 
-def search_by_phone(message):
-    part = message.text.strip()[-4:]
-    found = [f"📌 {data['name']} — {phone}\n💬 {data['info']}" for phone, data in clients.items() if phone.endswith(part)]
-    if found:
-        bot.send_message(message.chat.id, "\n\n".join(found), reply_markup=main_menu())
+def search_client(message):
+    query = message.text.strip()
+    results = db.search(User.phone.test(lambda val: val.endswith(query)))
+    if results:
+        response = "🔎 Найдено:\n\n"
+        for c in results:
+            response += f"👤 {c['name']}\n📱 {c['phone']}\n💬 {c['comment']}\n\n"
     else:
-        bot.send_message(message.chat.id, "Ничего не найдено.", reply_markup=main_menu())
+        response = "❗️Клиент не найден."
+    bot.send_message(message.chat.id, response, reply_markup=main_menu())
 
-# 📋 Список всех клиентов
-@bot.message_handler(func=lambda m: m.text == "📋 Список клиентов")
-def list_clients(message):
-    if not clients:
-        bot.send_message(message.chat.id, "Список пуст.", reply_markup=main_menu())
-        return
-    result = "\n\n".join([f"📌 {d['name']} — {p}\n💬 {d['info']}" for p, d in clients.items()])
-    bot.send_message(message.chat.id, result, reply_markup=main_menu())
+# Показать всех клиентов
+@bot.message_handler(func=lambda msg: msg.text == "📋 Список клиентов")
+def show_all(message):
+    clients = db.all()
+    if clients:
+        msg = "📋 Все клиенты:\n\n"
+        for c in clients:
+            msg += f"👤 {c['name']}\n📱 {c['phone']}\n💬 {c['comment']}\n\n"
+    else:
+        msg = "Список пуст."
+    bot.send_message(message.chat.id, msg, reply_markup=main_menu())
 
-# ✏️ Редактирование клиента
-@bot.message_handler(func=lambda m: m.text == "✏️ Редактировать")
-def ask_edit(message):
-    msg = bot.send_message(message.chat.id, "Введите номер клиента для редактирования:")
-    bot.register_next_step_handler(msg, edit_client)
-
-def edit_client(message):
-    phone = message.text
-    if phone not in clients:
-        bot.send_message(message.chat.id, "Клиент не найден.", reply_markup=main_menu())
-        return
-    msg = bot.send_message(message.chat.id, "Введите новые комментарии/инфо:")
-    bot.register_next_step_handler(msg, save_edit, phone)
-
-def save_edit(message, phone):
-    clients[phone]['info'] = message.text
-    save_data(clients)
-    bot.send_message(message.chat.id, "✅ Информация обновлена.", reply_markup=main_menu())
-
-# ❌ Удаление
-@bot.message_handler(func=lambda m: m.text == "❌ Удалить клиента")
-def ask_delete(message):
-    msg = bot.send_message(message.chat.id, "Введите номер клиента для удаления:")
-    bot.register_next_step_handler(msg, delete_client)
-
+# Удаление клиента
+@bot.message_handler(func=lambda msg: msg.text == "❌ Удалить")
 def delete_client(message):
-    phone = message.text
-    if phone in clients:
-        del clients[phone]
-        save_data(clients)
-        bot.send_message(message.chat.id, "❌ Клиент удалён.", reply_markup=main_menu())
-    else:
-        bot.send_message(message.chat.id, "Клиент не найден.", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера для удаления:")
+    bot.register_next_step_handler(message, delete_by_last_digits)
 
-# Webhook
+def delete_by_last_digits(message):
+    query = message.text.strip()
+    deleted = db.remove(User.phone.test(lambda val: val.endswith(query)))
+    if deleted:
+        bot.send_message(message.chat.id, "✅ Клиент удалён.")
+    else:
+        bot.send_message(message.chat.id, "❗️Клиент не найден.")
+    bot.send_message(message.chat.id, "Выберите действие:", reply_markup=main_menu())
+
+# Экспорт в Excel
+@bot.message_handler(func=lambda msg: msg.text == "📤 Экспорт в Excel")
+def export_excel(message):
+    clients = db.all()
+    if not clients:
+        bot.send_message(message.chat.id, "Список клиентов пуст.")
+        return
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Клиенты"
+    ws.append(["Имя", "Телефон", "Комментарий"])
+    for c in clients:
+        ws.append([c["name"], c["phone"], c["comment"]])
+
+    file_path = os.path.join(BASE_DIR, "clients_export.xlsx")
+    wb.save(file_path)
+
+    with open(file_path, "rb") as f:
+        bot.send_document(message.chat.id, InputFile(f, filename="Клиенты.xlsx"))
+
+# Webhook обработка
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
+    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
     bot.process_new_updates([update])
     return "OK", 200
 
@@ -126,8 +136,4 @@ def index():
     return "Бот работает!"
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    import time
-    time.sleep(1)
-    bot.set_webhook(url="https://client-notes-bot.onrender.com/" + TOKEN)
     serve(app, host="0.0.0.0", port=10000)
