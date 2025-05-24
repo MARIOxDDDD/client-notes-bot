@@ -1,166 +1,188 @@
-from flask import Flask, request, send_file
 import telebot
-from telebot import types
-import os
 import json
+import os
 import time
 import pandas as pd
+from flask import Flask, request
+from telebot import types
 from waitress import serve
 
+# === НАСТРОЙКИ ===
 TOKEN = "8036531554:AAGyyLFsy8LyW--jPsdZuqnSl-3AfcAFWz0"
-SERVICE_NAME = "clientnotesmarioxd"  # подставь имя Render-проекта без https и слеша
-WEBHOOK_URL = f"https://{SERVICE_NAME}.onrender.com/{TOKEN}"
+WEBHOOK_URL = f"https://clientnotesmarioxd.onrender.com/{TOKEN}"
+DATA_FILE = "clients.json"
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-DATA_FILE = "clients.json"
-user_states = {}
+# === ИНИЦИАЛИЗАЦИЯ ХРАНИЛИЩА ===
+if not os.path.exists(DATA_FILE):
+    with open(DATA_FILE, 'w') as f:
+        json.dump([], f)
 
-# --- Утилиты ---
-
-def load_clients():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return []
-
-def save_clients(clients):
-    with open(DATA_FILE, "w") as f:
-        json.dump(clients, f, indent=2)
-
-def export_to_excel():
-    clients = load_clients()
-    df = pd.DataFrame(clients)
-    df.to_excel("clients.xlsx", index=False)
-
-def get_main_menu():
+# === КНОПКИ МЕНЮ ===
+def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("➕ Добавить", "🔍 Найти")
-    markup.add("📋 Список клиентов", "✏️ Редактировать", "❌ Удалить")
-    markup.add("📤 Экспорт")
+    markup.row("➕ Добавить", "🔍 Найти")
+    markup.row("📋 Список клиентов", "✏️ Редактировать", "❌ Удалить")
+    markup.row("📤 Экспорт")
     return markup
 
-# --- Обработчики ---
+# === ЗАГРУЗКА / СОХРАНЕНИЕ ДАННЫХ ===
+def load_clients():
+    with open(DATA_FILE, 'r') as f:
+        return json.load(f)
 
+def save_clients(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# === КОМАНДА /start ===
 @bot.message_handler(commands=["start"])
 def start(message):
-    bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=get_main_menu())
+    bot.send_message(message.chat.id, "✅ Бот запущен! Выберите действие:", reply_markup=main_menu())
 
+# === СОСТОЯНИЯ ===
+user_state = {}
+
+# === ДОБАВЛЕНИЕ КЛИЕНТА ===
 @bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
-def add_start(message):
+def add_client(message):
+    user_state[message.chat.id] = {"action": "add"}
     bot.send_message(message.chat.id, "Введите имя клиента:")
-    user_states[message.chat.id] = {"action": "add"}
-    bot.register_next_step_handler(message, add_name)
 
-def add_name(message):
-    user_states[message.chat.id]["name"] = message.text
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "add_name")
+def get_phone(message):
+    user_state[message.chat.id]["name"] = message.text
+    user_state[message.chat.id]["action"] = "add_phone"
     bot.send_message(message.chat.id, "Введите номер телефона:")
-    bot.register_next_step_handler(message, add_phone)
 
-def add_phone(message):
-    user_states[message.chat.id]["phone"] = message.text
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "add_phone")
+def get_comment(message):
+    user_state[message.chat.id]["phone"] = message.text
+    user_state[message.chat.id]["action"] = "add_comment"
     bot.send_message(message.chat.id, "Опишите стрижку или комментарии:")
-    bot.register_next_step_handler(message, add_description)
 
-def add_description(message):
-    data = user_states.pop(message.chat.id)
-    client = {
-        "name": data["name"],
-        "phone": data["phone"],
-        "description": message.text
-    }
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "add_comment")
+def save_client(message):
+    user = user_state[message.chat.id]
     clients = load_clients()
-    clients.append(client)
+    clients.append({
+        "name": user["name"],
+        "phone": user["phone"],
+        "comment": message.text
+    })
     save_clients(clients)
-    bot.send_message(message.chat.id, "✅ Клиент добавлен!", reply_markup=get_main_menu())
+    user_state.pop(message.chat.id)
+    bot.send_message(message.chat.id, "✅ Клиент добавлен!", reply_markup=main_menu())
 
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "add")
+def get_name(message):
+    user_state[message.chat.id]["action"] = "add_name"
+    get_phone(message)
+
+# === ПОИСК КЛИЕНТА ===
 @bot.message_handler(func=lambda msg: msg.text == "🔍 Найти")
-def find_start(message):
+def search_client(message):
+    user_state[message.chat.id] = {"action": "search"}
     bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
-    bot.register_next_step_handler(message, find_client)
 
-def find_client(message):
-    last_digits = message.text.strip()
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "search")
+def do_search(message):
+    digits = message.text.strip()[-4:]
     clients = load_clients()
-    found = [c for c in clients if c["phone"].endswith(last_digits)]
+    found = [c for c in clients if c["phone"][-4:] == digits]
     if found:
         for c in found:
-            bot.send_message(message.chat.id, f"👤 {c['name']}\n📞 {c['phone']}\n✂️ {c['description']}")
+            bot.send_message(message.chat.id, f"👤 {c['name']}\n📞 {c['phone']}\n💬 {c['comment']}")
     else:
         bot.send_message(message.chat.id, "❌ Клиент не найден.")
-    bot.send_message(message.chat.id, "Выберите действие:", reply_markup=get_main_menu())
+    user_state.pop(message.chat.id)
 
+# === СПИСОК КЛИЕНТОВ ===
 @bot.message_handler(func=lambda msg: msg.text == "📋 Список клиентов")
 def list_clients(message):
     clients = load_clients()
-    if not clients:
-        bot.send_message(message.chat.id, "Список клиентов пуст.")
-    else:
-        text = ""
+    if clients:
         for c in clients:
-            text += f"👤 {c['name']} | 📞 {c['phone']} | ✂️ {c['description']}\n"
-        bot.send_message(message.chat.id, text)
-    bot.send_message(message.chat.id, "Выберите действие:", reply_markup=get_main_menu())
+            bot.send_message(message.chat.id, f"👤 {c['name']}\n📞 {c['phone']}\n💬 {c['comment']}")
+    else:
+        bot.send_message(message.chat.id, "Список клиентов пуст.")
 
+# === РЕДАКТИРОВАНИЕ КЛИЕНТА ===
 @bot.message_handler(func=lambda msg: msg.text == "✏️ Редактировать")
-def edit_start(message):
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента:")
-    bot.register_next_step_handler(message, edit_find)
+def edit_client(message):
+    user_state[message.chat.id] = {"action": "edit"}
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
 
-def edit_find(message):
-    digits = message.text.strip()
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "edit")
+def get_edit_comment(message):
+    digits = message.text.strip()[-4:]
+    user_state[message.chat.id] = {"action": "edit_comment", "digits": digits}
+    bot.send_message(message.chat.id, "Введите новый комментарий:")
+
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "edit_comment")
+def do_edit(message):
+    data = user_state.pop(message.chat.id)
     clients = load_clients()
-    for i, c in enumerate(clients):
-        if c["phone"].endswith(digits):
-            user_states[message.chat.id] = {"index": i}
-            bot.send_message(message.chat.id, f"Новый комментарий для {c['name']}:")
-            bot.register_next_step_handler(message, edit_comment)
-            return
-    bot.send_message(message.chat.id, "Клиент не найден.", reply_markup=get_main_menu())
+    found = False
+    for c in clients:
+        if c["phone"][-4:] == data["digits"]:
+            c["comment"] = message.text
+            found = True
+    if found:
+        save_clients(clients)
+        bot.send_message(message.chat.id, "✅ Комментарий обновлён.")
+    else:
+        bot.send_message(message.chat.id, "❌ Клиент не найден.")
 
-def edit_comment(message):
-    index = user_states.pop(message.chat.id)["index"]
-    clients = load_clients()
-    clients[index]["description"] = message.text
-    save_clients(clients)
-    bot.send_message(message.chat.id, "Комментарий обновлён!", reply_markup=get_main_menu())
-
+# === УДАЛЕНИЕ КЛИЕНТА ===
 @bot.message_handler(func=lambda msg: msg.text == "❌ Удалить")
-def delete_start(message):
-    bot.send_message(message.chat.id, "Введите последние 4 цифры номера клиента:")
-    bot.register_next_step_handler(message, delete_client)
-
 def delete_client(message):
-    digits = message.text.strip()
-    clients = load_clients()
-    for i, c in enumerate(clients):
-        if c["phone"].endswith(digits):
-            del clients[i]
-            save_clients(clients)
-            bot.send_message(message.chat.id, "Клиент удалён!", reply_markup=get_main_menu())
-            return
-    bot.send_message(message.chat.id, "Клиент не найден.", reply_markup=get_main_menu())
+    user_state[message.chat.id] = {"action": "delete"}
+    bot.send_message(message.chat.id, "Введите последние 4 цифры номера:")
 
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id, {}).get("action") == "delete")
+def do_delete(message):
+    digits = message.text.strip()[-4:]
+    clients = load_clients()
+    updated = [c for c in clients if c["phone"][-4:] != digits]
+    if len(updated) < len(clients):
+        save_clients(updated)
+        bot.send_message(message.chat.id, "✅ Клиент удалён.")
+    else:
+        bot.send_message(message.chat.id, "❌ Клиент не найден.")
+    user_state.pop(message.chat.id)
+
+# === ЭКСПОРТ В EXCEL ===
 @bot.message_handler(func=lambda msg: msg.text == "📤 Экспорт")
 def export_excel(message):
-    export_to_excel()
-    bot.send_document(message.chat.id, open("clients.xlsx", "rb"), caption="📤 Экспорт завершён.")
+    clients = load_clients()
+    if not clients:
+        bot.send_message(message.chat.id, "Список клиентов пуст.")
+        return
+    df = pd.DataFrame(clients)
+    file_path = "clients.xlsx"
+    df.to_excel(file_path, index=False)
+    with open(file_path, 'rb') as f:
+        bot.send_document(message.chat.id, f)
+    os.remove(file_path)
 
-# --- Webhook Flask ---
-
-@app.route(f"/{TOKEN}", methods=["POST"])
+# === ОБРАБОТКА ВЕБХУКА ===
+@app.route(f"/{TOKEN}", methods=['POST'])
 def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+    update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
     bot.process_new_updates([update])
     return "OK", 200
 
-@app.route("/")
+@app.route('/')
 def index():
-    return "Бот работает!"
+    return "Бот запущен!"
+
+# === ЗАПУСК (Webhook) ===
+bot.remove_webhook()
+time.sleep(1)
+bot.set_webhook(url=WEBHOOK_URL)
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.set_webhook(url=WEBHOOK_URL)
-    serve(app, host="0.0.0.0", port=10000)
+    serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
