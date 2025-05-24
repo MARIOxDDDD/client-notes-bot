@@ -1,33 +1,23 @@
 import telebot
 import os
-import requests
-import logging
+from flask import Flask
 
-# Настройка логирования (чтобы видеть ошибки)
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Токен бота (Render возьмёт его из переменных окружения)
+app = Flask(__name__)
 TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-# Принудительный сброс старых подключений
-try:
-    bot.remove_webhook()
-    requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset=-1")
-    logger.info("✅ Предыдущие соединения сброшены")
-except Exception as e:
-    logger.error(f"❌ Ошибка сброса: {e}")
+# Минимальный веб-сервер для Render
+@app.route('/')
+def home():
+    return "Бот работает! Порт 10000 открыт."
 
 # Команда /start
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "Я работаю без ошибок!")
+    bot.reply_to(message, "✅ Я снова работаю! Напиши /add чтобы добавить клиента.")
 
-# Запуск бота
+# Запуск
 if __name__ == '__main__':
-    logger.info("🔄 Бот запускается...")
-    bot.polling(none_stop=True, skip_pending=True, interval=1)
+    import threading
+    threading.Thread(target=app.run, kwargs={'host':'0.0.0.0','port':10000}).start()
+    bot.polling(none_stop=True)
