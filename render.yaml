@@ -1,6 +1,9 @@
 services:
   - type: web
     name: client-notes-bot
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "bash start.sh"
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PORT
+        value: 10000
