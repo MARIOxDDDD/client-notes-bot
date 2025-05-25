@@ -37,6 +37,7 @@ def main_menu():
     markup.add("➕ Добавить", "🔍 Найти")
     markup.add("📋 Список клиентов", "📤 Экспорт")
     markup.add("📝 Редактировать", "❌ Удалить")
+    markup.add("📈 Статистика") 
     return markup
 
 @bot.message_handler(commands=["start"])
@@ -179,6 +180,31 @@ def confirm_delete(message):
     else:
         bot.send_message(message.chat.id, "❌ Отменено.", reply_markup=main_menu())
     user_states.pop(message.chat.id, None)
+
+@bot.message_handler(func=lambda m: m.text == "📈 Статистика")
+def show_statistics(message):
+    # Всего клиентов
+    cur.execute("SELECT COUNT(*) FROM clients")
+    total = cur.fetchone()[0]
+
+    # За последние 7 дней
+    cur.execute("SELECT COUNT(*) FROM clients WHERE created_at >= NOW() - INTERVAL '7 days'")
+    last_week = cur.fetchone()[0]
+
+    # За текущий месяц
+    cur.execute("""
+        SELECT COUNT(*) FROM clients
+        WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)
+    """)
+    this_month = cur.fetchone()[0]
+
+    stats = (
+        f"📊 Статистика:\n\n"
+        f"👥 Всего клиентов: {total}\n"
+        f"🗓 За последние 7 дней: {last_week}\n"
+        f"📆 В этом месяце: {this_month}"
+    )
+    bot.send_message(message.chat.id, stats)
 
 # === ВЕБХУК ===
 bot.remove_webhook()
